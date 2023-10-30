@@ -1,0 +1,125 @@
+#pragma kernel InitMeshData
+#pragma kernel UpdateMesh
+#pragma kernel RecalculateNormals
+
+#include "Utils.hlsl"
+
+RWByteAddressBuffer vertices;
+ByteAddressBuffer indices;
+
+RWByteAddressBuffer originalVertices;
+RWByteAddressBuffer displacedVertices;
+RWByteAddressBuffer velocities;
+
+uint vertexCount;
+uint indexCount;
+uint vertexDataStride;
+uint positionAttributeOffset;
+uint normalAttributeOffset;
+
+float uniformScale;
+float springForce;
+float damping;
+
+float deltaTime;
+float4x4 inverseTransform;
+
+float3 forcePoint;
+float force;
+
+void updateVertex(int i);
+void addForceToVertex(int i, float3 pos, float force);
+
+#define FLOAT_SIZE 4
+
+[numthreads(1,1,1)]
+void InitMeshData(uint3 id : SV_DispatchThreadID)
+{
+    for (uint i = 0; i < vertexCount; i++)
+    {
+        const float3 v = asfloat(vertices.Load3(i * vertexDataStride + positionAttributeOffset));
+        originalVertices.Store3(i * FLOAT_SIZE * 3, asuint(v));
+        displacedVertices.Store3(i * FLOAT_SIZE * 3, asuint(v));
+        velocities.Store3(i * FLOAT_SIZE * 3, asuint(float3(0.0, 0.0, 0.0)));
+    }
+}
+
+[numthreads(1,1,1)]
+void UpdateMesh(uint3 id : SV_DispatchThreadID)
+{
+    for (uint i = 0; i < vertexCount; i++)
+    {
+        if (force > 0.1f)
+        {
+            forcePoint = mul(float4(forcePoint, 1.0), inverseTransform);
+            addForceToVertex(i, forcePoint, force);
+        }
+        updateVertex(i); // todo threading
+    }
+}
+
+[numthreads(1,1,1)]
+void RecalculateNormals(uint3 id : SV_DispatchThreadID)
+{
+    for (uint i = 0; i < indexCount; i += 3)
+    {
+        // assume that mesh use 16-bit indices format
+
+        uint i0;
+        uint i1;
+        uint i2;
+        if (i % 2 == 0)
+        {
+            i0 = indices.Load(i * 2) & 0xFFFF;
+            i1 = (indices.Load((i + 1) * 2) & 0xFFFF0000) >> 16;
+            i2 = indices.Load((i + 2) * 2) & 0xFFFF;
+        }
+        else
+        {
+            i0 = (indices.Load(i * 2) & 0xFFFF0000) >> 16;
+            i1 = indices.Load((i + 1) * 2) & 0xFFFF;
+            i2 = (indices.Load((i + 2) * 2) & 0xFFFF0000) >> 16;
+        }
+
+        const float3 v1 = asfloat(vertices.Load3(i0 * vertexDataStride + positionAttributeOffset));
+        const float3 v2 = asfloat(vertices.Load3(i1 * vertexDataStride + positionAttributeOffset));
+        const float3 v3 = asfloat(vertices.Load3(i2 * vertexDataStride + positionAttributeOffset));
+
+        const float3 normal = cross(v2 - v1, v3 - v1);
+        vertices.Store3(i0 * vertexDataStride + normalAttributeOffset, asuint(normal));
+        vertices.Store3(i1 * vertexDataStride + normalAttributeOffset, asuint(normal));
+        vertices.Store3(i2 * vertexDataStride + normalAttributeOffset, asuint(normal));
+    }
+}
+
+void addForceToVertex(int i, float3 pos, float force)
+{
+    const float3 currentDisplaced = asfloat(displacedVertices.Load3(i * FLOAT_SIZE * 3));
+    const float3 currentVelocity = asfloat(velocities.Load3(i * FLOAT_SIZE * 3));
+
+    float3 pointToVertex = currentDisplaced - pos;
+    pointToVertex *= uniformScale;
+
+    float SQR_MAG_TMP = length(pointToVertex) * length(pointToVertex);
+
+    const float attenuatedForce = force / (1.0 + SQR_MAG_TMP);
+    const float velocity = attenuatedForce * deltaTime;
+    velocities.Store3(i * FLOAT_SIZE * 3, asuint(currentVelocity + normalize(pointToVertex) * velocity));
+}
+
+void updateVertex(int i)
+{
+    const float3 original = asfloat(originalVertices.Load3(i * FLOAT_SIZE * 3));
+    const float3 currentVelocity = asfloat(velocities.Load3(i * FLOAT_SIZE * 3));
+    const float3 currentDisplaced = asfloat(displacedVertices.Load3(i * FLOAT_SIZE * 3));
+
+    float3 velocity = currentVelocity;
+    float3 displacement = currentDisplaced - original;
+    displacement *= uniformScale;
+    velocity -= displacement * springForce * deltaTime;
+    velocity *= 1.0 - damping * deltaTime;
+    velocities.Store3(i * FLOAT_SIZE * 3, asuint(velocity));
+    const float3 displaced = currentDisplaced + velocity * (deltaTime / uniformScale);
+    displacedVertices.Store3(i * FLOAT_SIZE * 3, asuint(displaced));
+    vertices.Store3(i * vertexDataStride + positionAttributeOffset, asuint(displaced));
+}
